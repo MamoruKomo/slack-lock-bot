@@ -151,7 +151,8 @@ function areaDone(area, statusMap) {
 function isAllDone(dateStr) {
   const data = loadData();
   if (data.currentDate !== dateStr) return false;
-  return ASSIGNMENTS.every((a) => areaDone(a, data.status));
+  const statusMap = data.status || {};
+  return ASSIGNMENTS.every((a) => areaDone(a, statusMap));
 }
 
 function buildDailyBlocks(statusMap) {
@@ -167,8 +168,8 @@ function buildDailyBlocks(statusMap) {
     const mention = mentionList(area.userIds);
     const aed = area.needsAed ? '（AED確認含む）' : '';
     const st = normalizeStatusEntry(statusMap?.[area.id]);
-    const lockText = st.lock ? '施錠確認済み' : '施錠確認';
-    const aedText = st.aed ? 'AED確認済み' : 'AED確認';
+    const lockText = st.lock ? '施錠確認済み' : '施錠';
+    const aedText = st.aed ? 'AED確認済み' : 'AED';
     blocks.push({
       type: 'section',
       text: {
@@ -192,6 +193,7 @@ function buildDailyBlocks(statusMap) {
                 type: 'button',
                 action_id: 'aed_check',
                 text: { type: 'plain_text', text: aedText, emoji: true },
+                style: 'danger',
                 value: `${area.id}`,
               },
             ]
