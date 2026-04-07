@@ -7,11 +7,24 @@ const { App } = require('@slack/bolt');
 const TZ = process.env.TZ || 'Asia/Tokyo';
 const CHANNEL_ID = process.env.SLACK_CHANNEL_ID;
 
+function parseUserIds(value) {
+  if (!value) return [];
+  return value
+    .split(',')
+    .map((v) => v.trim())
+    .filter(Boolean);
+}
+
+function mentionList(userIds) {
+  if (!userIds || userIds.length === 0) return '未設定';
+  return userIds.map((id) => `<@${id}>`).join(' ');
+}
+
 const ASSIGNMENTS = [
-  { id: 'A', place: 'A棟', userId: process.env.USER_A, needsAed: true },
-  { id: 'B1', place: 'B棟1F', userId: process.env.USER_B1, needsAed: false },
-  { id: 'B2', place: 'B棟2F', userId: process.env.USER_B2, needsAed: false },
-  { id: 'C', place: 'C棟', userId: process.env.USER_C, needsAed: true },
+  { id: 'A', place: 'A棟', userIds: parseUserIds(process.env.USER_A), needsAed: true },
+  { id: 'B1', place: 'B棟1F', userIds: parseUserIds(process.env.USER_B1), needsAed: false },
+  { id: 'B2', place: 'B棟2F', userIds: parseUserIds(process.env.USER_B2), needsAed: false },
+  { id: 'C', place: 'C棟', userIds: parseUserIds(process.env.USER_C), needsAed: true },
 ];
 
 const DATA_PATH = path.join(__dirname, 'data.json');
@@ -84,7 +97,7 @@ function buildDailyBlocks() {
   ];
 
   for (const area of ASSIGNMENTS) {
-    const mention = area.userId ? `<@${area.userId}>` : '未設定';
+    const mention = mentionList(area.userIds);
     const aed = area.needsAed ? '（AED確認含む）' : '';
     blocks.push({
       type: 'section',
@@ -139,7 +152,10 @@ async function postReminder() {
   if (pending.length === 0) return;
 
   const lines = pending
-    .map((a) => `${a.place} ${a.userId ? `<@${a.userId}>` : ''}`.trim())
+    .map((a) => {
+      const mention = mentionList(a.userIds);
+      return `${a.place} ${mention}`.trim();
+    })
     .join('\n');
 
   await app.client.chat.postMessage({
