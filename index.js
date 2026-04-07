@@ -7,6 +7,7 @@ const { App } = require('@slack/bolt');
 const TZ = process.env.TZ || 'Asia/Tokyo';
 const CHANNEL_ID = process.env.SLACK_CHANNEL_ID;
 const RUN_ON_START = process.env.RUN_ON_START === '1';
+const RUN_REMINDER_ON_START = process.env.RUN_REMINDER_ON_START === '1';
 
 function parseUserIds(value) {
   if (!value) return [];
@@ -87,14 +88,16 @@ function ensureDate(dateStr) {
   return data;
 }
 
-function markDone(dateStr, areaId) {
+function markDoneType(dateStr, areaId, type) {
   const data = loadData();
   if (data.currentDate !== dateStr) {
     data.currentDate = dateStr;
     data.status = {};
     data.threadTs = null;
   }
-  data.status[areaId] = true;
+  const current = normalizeStatusEntry(data.status[areaId]);
+  current[type] = true;
+  data.status[areaId] = current;
   saveData(data);
 }
 
@@ -114,13 +117,44 @@ function getThreadTs(dateStr) {
   return data.threadTs || null;
 }
 
+async function updateParentMessage(dateStr, client) {
+  if (!CHANNEL_ID) return;
+  const threadTs = getThreadTs(dateStr);
+  if (!threadTs) return;
+  const data = loadData();
+  if (data.currentDate !== dateStr) return;
+  await client.chat.update({
+    channel: CHANNEL_ID,
+    ts: threadTs,
+    text: '施錠確認（22:00）',
+    blocks: buildDailyBlocks(data.status),
+  });
+}
+
+function normalizeStatusEntry(entry) {
+  if (!entry) return { lock: false, aed: false };
+  if (typeof entry === 'boolean') {
+    return { lock: entry, aed: false };
+  }
+  return {
+    lock: Boolean(entry.lock),
+    aed: Boolean(entry.aed),
+  };
+}
+
+function areaDone(area, statusMap) {
+  const st = normalizeStatusEntry(statusMap?.[area.id]);
+  if (area.needsAed) return st.lock && st.aed;
+  return st.lock;
+}
+
 function isAllDone(dateStr) {
   const data = loadData();
   if (data.currentDate !== dateStr) return false;
-  return ASSIGNMENTS.every((a) => data.status[a.id]);
+  return ASSIGNMENTS.every((a) => areaDone(a, data.status));
 }
 
-function buildDailyBlocks() {
+function buildDailyBlocks(statusMap) {
   const blocks = [
     {
       type: 'header',
@@ -132,6 +166,9 @@ function buildDailyBlocks() {
   for (const area of ASSIGNMENTS) {
     const mention = mentionList(area.userIds);
     const aed = area.needsAed ? '（AED確認含む）' : '';
+    const st = normalizeStatusEntry(statusMap?.[area.id]);
+    const lockText = st.lock ? '施錠確認済み' : '施錠確認';
+    const aedText = st.aed ? 'AED確認済み' : 'AED確認';
     blocks.push({
       type: 'section',
       text: {
@@ -145,7 +182,7 @@ function buildDailyBlocks() {
         {
           type: 'button',
           action_id: 'lock_check',
-          text: { type: 'plain_text', text: '施錠', emoji: true },
+          text: { type: 'plain_text', text: lockText, emoji: true },
           style: 'primary',
           value: `${area.id}`,
         },
@@ -154,7 +191,7 @@ function buildDailyBlocks() {
               {
                 type: 'button',
                 action_id: 'aed_check',
-                text: { type: 'plain_text', text: 'AED', emoji: true },
+                text: { type: 'plain_text', text: aedText, emoji: true },
                 value: `${area.id}`,
               },
             ]
@@ -176,11 +213,11 @@ const app = new App({
 async function postDailyMessage() {
   if (!CHANNEL_ID) return;
   const dateStr = currentDateStr();
-  ensureDate(dateStr);
+  const data = ensureDate(dateStr);
   const res = await app.client.chat.postMessage({
     channel: CHANNEL_ID,
     text: '施錠確認（22:00）',
-    blocks: buildDailyBlocks(),
+    blocks: buildDailyBlocks(data.status),
   });
   if (res && res.ts) {
     setThreadTs(dateStr, res.ts);
@@ -191,7 +228,7 @@ async function postReminder() {
   if (!CHANNEL_ID) return;
   const dateStr = currentDateStr();
   const data = ensureDate(dateStr);
-  const pending = ASSIGNMENTS.filter((a) => !data.status[a.id]);
+  const pending = ASSIGNMENTS.filter((a) => !areaDone(a, data.status));
 
   if (pending.length === 0) return;
 
@@ -231,15 +268,16 @@ app.action('lock_check', async ({ ack, body, payload, client }) => {
   const dateStr = currentDateStr();
   const timeStr = formatTime(now);
   ensureDate(dateStr);
-  markDone(dateStr, area.id);
+  markDoneType(dateStr, area.id, 'lock');
 
   if (CHANNEL_ID) {
     const threadTs = getThreadTs(dateStr);
     await client.chat.postMessage({
       channel: CHANNEL_ID,
       ...(threadTs ? { thread_ts: threadTs } : {}),
-      text: `${area.place}：確認済み by <@${body.user.id}>（${timeStr}）`,
+      text: `${area.place}：施錠確認済み by <@${body.user.id}>（${timeStr}）`,
     });
+    await updateParentMessage(dateStr, client);
 
     if (isAllDone(dateStr)) {
       await client.chat.postMessage({
@@ -261,7 +299,7 @@ app.action('aed_check', async ({ ack, body, payload, client }) => {
   const dateStr = currentDateStr();
   const timeStr = formatTime(now);
   ensureDate(dateStr);
-  markDone(dateStr, area.id);
+  markDoneType(dateStr, area.id, 'aed');
 
   if (CHANNEL_ID) {
     const threadTs = getThreadTs(dateStr);
@@ -270,6 +308,7 @@ app.action('aed_check', async ({ ack, body, payload, client }) => {
       ...(threadTs ? { thread_ts: threadTs } : {}),
       text: `${area.place}：AED確認済み by <@${body.user.id}>（${timeStr}）`,
     });
+    await updateParentMessage(dateStr, client);
 
     if (isAllDone(dateStr)) {
       await client.chat.postMessage({
@@ -284,6 +323,9 @@ app.action('aed_check', async ({ ack, body, payload, client }) => {
   await app.start();
   if (RUN_ON_START) {
     await postDailyMessage();
+  }
+  if (RUN_REMINDER_ON_START) {
+    await postReminder();
   }
   cron.schedule('0 22 * * *', postDailyMessage, { timezone: TZ });
   cron.schedule('50 23 * * *', postReminder, { timezone: TZ });
