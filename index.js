@@ -6,6 +6,7 @@ const { App } = require('@slack/bolt');
 
 const TZ = process.env.TZ || 'Asia/Tokyo';
 const CHANNEL_ID = process.env.SLACK_CHANNEL_ID;
+const RUN_ON_START = process.env.RUN_ON_START === '1';
 
 function parseUserIds(value) {
   if (!value) return [];
@@ -46,14 +47,28 @@ function formatTime(d) {
   return `${h}:${m}`;
 }
 
+function effectiveDate(d) {
+  const hour = d.getHours();
+  if (hour < 12) {
+    const prev = new Date(d);
+    prev.setDate(prev.getDate() - 1);
+    return prev;
+  }
+  return d;
+}
+
+function currentDateStr() {
+  return formatDate(effectiveDate(nowInTz()));
+}
+
 function loadData() {
   if (!fs.existsSync(DATA_PATH)) {
-    return { currentDate: null, status: {} };
+    return { currentDate: null, status: {}, threadTs: null };
   }
   try {
     return JSON.parse(fs.readFileSync(DATA_PATH, 'utf8'));
   } catch {
-    return { currentDate: null, status: {} };
+    return { currentDate: null, status: {}, threadTs: null };
   }
 }
 
@@ -66,6 +81,7 @@ function ensureDate(dateStr) {
   if (data.currentDate !== dateStr) {
     data.currentDate = dateStr;
     data.status = {};
+    data.threadTs = null;
     saveData(data);
   }
   return data;
@@ -76,9 +92,26 @@ function markDone(dateStr, areaId) {
   if (data.currentDate !== dateStr) {
     data.currentDate = dateStr;
     data.status = {};
+    data.threadTs = null;
   }
   data.status[areaId] = true;
   saveData(data);
+}
+
+function setThreadTs(dateStr, threadTs) {
+  const data = loadData();
+  if (data.currentDate !== dateStr) {
+    data.currentDate = dateStr;
+    data.status = {};
+  }
+  data.threadTs = threadTs;
+  saveData(data);
+}
+
+function getThreadTs(dateStr) {
+  const data = loadData();
+  if (data.currentDate !== dateStr) return null;
+  return data.threadTs || null;
 }
 
 function isAllDone(dateStr) {
@@ -112,10 +145,20 @@ function buildDailyBlocks() {
         {
           type: 'button',
           action_id: 'lock_check',
-          text: { type: 'plain_text', text: '確認済み', emoji: true },
+          text: { type: 'plain_text', text: '施錠', emoji: true },
           style: 'primary',
           value: `${area.id}`,
         },
+        ...(area.needsAed
+          ? [
+              {
+                type: 'button',
+                action_id: 'aed_check',
+                text: { type: 'plain_text', text: 'AED', emoji: true },
+                value: `${area.id}`,
+              },
+            ]
+          : []),
       ],
     });
   }
@@ -132,20 +175,21 @@ const app = new App({
 
 async function postDailyMessage() {
   if (!CHANNEL_ID) return;
-  const now = nowInTz();
-  const dateStr = formatDate(now);
+  const dateStr = currentDateStr();
   ensureDate(dateStr);
-  await app.client.chat.postMessage({
+  const res = await app.client.chat.postMessage({
     channel: CHANNEL_ID,
     text: '施錠確認（22:00）',
     blocks: buildDailyBlocks(),
   });
+  if (res && res.ts) {
+    setThreadTs(dateStr, res.ts);
+  }
 }
 
 async function postReminder() {
   if (!CHANNEL_ID) return;
-  const now = nowInTz();
-  const dateStr = formatDate(now);
+  const dateStr = currentDateStr();
   const data = ensureDate(dateStr);
   const pending = ASSIGNMENTS.filter((a) => !data.status[a.id]);
 
@@ -158,9 +202,11 @@ async function postReminder() {
     })
     .join('\n');
 
+  const threadTs = getThreadTs(dateStr);
   await app.client.chat.postMessage({
     channel: CHANNEL_ID,
     text: '未確認の施錠があります',
+    ...(threadTs ? { thread_ts: threadTs } : {}),
     blocks: [
       {
         type: 'section',
@@ -182,15 +228,47 @@ app.action('lock_check', async ({ ack, body, payload, client }) => {
   if (!area) return;
 
   const now = nowInTz();
-  const dateStr = formatDate(now);
+  const dateStr = currentDateStr();
   const timeStr = formatTime(now);
   ensureDate(dateStr);
   markDone(dateStr, area.id);
 
   if (CHANNEL_ID) {
+    const threadTs = getThreadTs(dateStr);
     await client.chat.postMessage({
       channel: CHANNEL_ID,
+      ...(threadTs ? { thread_ts: threadTs } : {}),
       text: `${area.place}：確認済み by <@${body.user.id}>（${timeStr}）`,
+    });
+
+    if (isAllDone(dateStr)) {
+      await client.chat.postMessage({
+        channel: CHANNEL_ID,
+        text: '全員回答済み。完了',
+      });
+    }
+  }
+});
+
+app.action('aed_check', async ({ ack, body, payload, client }) => {
+  await ack();
+
+  const areaId = payload.value;
+  const area = ASSIGNMENTS.find((a) => a.id === areaId);
+  if (!area) return;
+
+  const now = nowInTz();
+  const dateStr = currentDateStr();
+  const timeStr = formatTime(now);
+  ensureDate(dateStr);
+  markDone(dateStr, area.id);
+
+  if (CHANNEL_ID) {
+    const threadTs = getThreadTs(dateStr);
+    await client.chat.postMessage({
+      channel: CHANNEL_ID,
+      ...(threadTs ? { thread_ts: threadTs } : {}),
+      text: `${area.place}：AED確認済み by <@${body.user.id}>（${timeStr}）`,
     });
 
     if (isAllDone(dateStr)) {
@@ -204,6 +282,9 @@ app.action('lock_check', async ({ ack, body, payload, client }) => {
 
 (async () => {
   await app.start();
+  if (RUN_ON_START) {
+    await postDailyMessage();
+  }
   cron.schedule('0 22 * * *', postDailyMessage, { timezone: TZ });
   cron.schedule('50 23 * * *', postReminder, { timezone: TZ });
   const now = nowInTz();
