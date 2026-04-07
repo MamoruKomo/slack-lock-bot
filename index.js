@@ -88,20 +88,32 @@ function ensureDate(dateStr) {
   return data;
 }
 
-function markDoneType(dateStr, areaId, type, userId) {
+function toggleDoneType(dateStr, area, type, userId) {
   const data = loadData();
   if (data.currentDate !== dateStr) {
     data.currentDate = dateStr;
     data.status = {};
     data.threadTs = null;
   }
-  const current = normalizeStatusEntry(data.status[areaId]);
-  const pressedBy = current[type].pressedBy;
-  if (userId && !pressedBy.includes('*') && !pressedBy.includes(userId)) {
-    pressedBy.push(userId);
+  const current = normalizeStatusEntry(data.status[area.id]);
+  let pressedBy = current[type].pressedBy;
+  if (pressedBy.includes('*')) {
+    pressedBy = Array.isArray(area.userIds) ? [...area.userIds] : [];
   }
-  data.status[areaId] = current;
+  let isOn = false;
+  if (userId) {
+    if (pressedBy.includes(userId)) {
+      pressedBy = pressedBy.filter((id) => id !== userId);
+      isOn = false;
+    } else {
+      pressedBy = [...pressedBy, userId];
+      isOn = true;
+    }
+  }
+  current[type].pressedBy = pressedBy;
+  data.status[area.id] = current;
   saveData(data);
+  return isOn;
 }
 
 function setThreadTs(dateStr, threadTs) {
@@ -183,7 +195,15 @@ function isAllDone(dateStr) {
   const data = loadData();
   if (data.currentDate !== dateStr) return false;
   const statusMap = data.status || {};
-  return ASSIGNMENTS.every((a) => areaDone(a, statusMap));
+  return ASSIGNMENTS.every((a) => {
+    const st = normalizeStatusEntry(statusMap?.[a.id]);
+    const lockAny = st.lock.pressedBy.length > 0;
+    if (a.needsAed) {
+      const aedAny = st.aed.pressedBy.length > 0;
+      return lockAny && aedAny;
+    }
+    return lockAny;
+  });
 }
 
 function buildDailyBlocks(statusMap) {
@@ -199,8 +219,8 @@ function buildDailyBlocks(statusMap) {
     const mention = mentionList(area.userIds);
     const aed = area.needsAed ? 'AEDの確認もしてください！' : '';
     const st = normalizeStatusEntry(statusMap?.[area.id]);
-    const lockDone = isDoneForAll(area.userIds, st.lock.pressedBy);
-    const aedDone = isDoneForAll(area.userIds, st.aed.pressedBy);
+    const lockDone = st.lock.pressedBy.length > 0;
+    const aedDone = st.aed.pressedBy.length > 0;
     const lockText = lockDone ? '施錠確認済み' : '施錠';
     const aedText = aedDone ? 'AED確認済み' : 'AED';
     const lockStyle = lockDone ? undefined : 'primary';
@@ -220,7 +240,6 @@ function buildDailyBlocks(statusMap) {
           action_id: 'lock_check',
           text: { type: 'plain_text', text: lockText, emoji: true },
           ...(lockStyle ? { style: lockStyle } : {}),
-          ...(lockDone ? { disabled: true } : {}),
           value: `${area.id}`,
         },
         ...(area.needsAed
@@ -230,7 +249,6 @@ function buildDailyBlocks(statusMap) {
                 action_id: 'aed_check',
                 text: { type: 'plain_text', text: aedText, emoji: true },
                 ...(aedStyle ? { style: aedStyle } : {}),
-                ...(aedDone ? { disabled: true } : {}),
                 value: `${area.id}`,
               },
             ]
@@ -255,7 +273,7 @@ async function postDailyMessage() {
   const data = ensureDate(dateStr);
   const res = await app.client.chat.postMessage({
     channel: CHANNEL_ID,
-    text: '施錠確認（22:00）',
+    text: '22:00です！施錠確認してください',
     blocks: buildDailyBlocks(data.status),
   });
   if (res && res.ts) {
@@ -309,15 +327,17 @@ app.action('lock_check', async ({ ack, body, payload, client }) => {
   const dateStr = currentDateStr();
   const timeStr = formatTime(now);
   ensureDate(dateStr);
-  markDoneType(dateStr, area.id, 'lock', body.user.id);
+  const turnedOn = toggleDoneType(dateStr, area, 'lock', body.user.id);
 
   if (CHANNEL_ID) {
     const threadTs = getThreadTs(dateStr);
-    await client.chat.postMessage({
-      channel: CHANNEL_ID,
-      ...(threadTs ? { thread_ts: threadTs } : {}),
-      text: `${area.place}：施錠確認済み by <@${body.user.id}>（${timeStr}）`,
-    });
+    if (turnedOn) {
+      await client.chat.postMessage({
+        channel: CHANNEL_ID,
+        ...(threadTs ? { thread_ts: threadTs } : {}),
+        text: `${area.place}：施錠確認済み by <@${body.user.id}>（${timeStr}）`,
+      });
+    }
     await updateParentMessage(dateStr, client);
 
     if (isAllDone(dateStr)) {
@@ -340,15 +360,17 @@ app.action('aed_check', async ({ ack, body, payload, client }) => {
   const dateStr = currentDateStr();
   const timeStr = formatTime(now);
   ensureDate(dateStr);
-  markDoneType(dateStr, area.id, 'aed', body.user.id);
+  const turnedOn = toggleDoneType(dateStr, area, 'aed', body.user.id);
 
   if (CHANNEL_ID) {
     const threadTs = getThreadTs(dateStr);
-    await client.chat.postMessage({
-      channel: CHANNEL_ID,
-      ...(threadTs ? { thread_ts: threadTs } : {}),
-      text: `${area.place}：AED確認済み by <@${body.user.id}>（${timeStr}）`,
-    });
+    if (turnedOn) {
+      await client.chat.postMessage({
+        channel: CHANNEL_ID,
+        ...(threadTs ? { thread_ts: threadTs } : {}),
+        text: `${area.place}：AED確認済み by <@${body.user.id}>（${timeStr}）`,
+      });
+    }
     await updateParentMessage(dateStr, client);
 
     if (isAllDone(dateStr)) {
