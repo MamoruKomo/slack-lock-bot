@@ -88,7 +88,7 @@ function ensureDate(dateStr) {
   return data;
 }
 
-function markDoneType(dateStr, areaId, type) {
+function markDoneType(dateStr, areaId, type, userId) {
   const data = loadData();
   if (data.currentDate !== dateStr) {
     data.currentDate = dateStr;
@@ -96,7 +96,10 @@ function markDoneType(dateStr, areaId, type) {
     data.threadTs = null;
   }
   const current = normalizeStatusEntry(data.status[areaId]);
-  current[type] = true;
+  const pressedBy = current[type].pressedBy;
+  if (userId && !pressedBy.includes('*') && !pressedBy.includes(userId)) {
+    pressedBy.push(userId);
+  }
   data.status[areaId] = current;
   saveData(data);
 }
@@ -132,20 +135,48 @@ async function updateParentMessage(dateStr, client) {
 }
 
 function normalizeStatusEntry(entry) {
-  if (!entry) return { lock: false, aed: false };
+  const empty = { lock: { pressedBy: [] }, aed: { pressedBy: [] } };
+  if (!entry) return empty;
   if (typeof entry === 'boolean') {
-    return { lock: entry, aed: false };
+    return {
+      lock: { pressedBy: entry ? ['*'] : [] },
+      aed: { pressedBy: [] },
+    };
   }
+  const lock =
+    entry.lock && typeof entry.lock === 'object'
+      ? entry.lock
+      : { pressedBy: entry.lock ? ['*'] : [] };
+  const aed =
+    entry.aed && typeof entry.aed === 'object'
+      ? entry.aed
+      : { pressedBy: entry.aed ? ['*'] : [] };
   return {
-    lock: Boolean(entry.lock),
-    aed: Boolean(entry.aed),
+    lock: { pressedBy: Array.isArray(lock.pressedBy) ? lock.pressedBy : [] },
+    aed: { pressedBy: Array.isArray(aed.pressedBy) ? aed.pressedBy : [] },
   };
+}
+
+function isDoneForAll(assignedUsers, pressedBy) {
+  if (pressedBy.includes('*')) return true;
+  if (!assignedUsers || assignedUsers.length === 0) return false;
+  return assignedUsers.every((id) => pressedBy.includes(id));
+}
+
+function pendingUsersFor(assignedUsers, pressedBy) {
+  if (pressedBy.includes('*')) return [];
+  if (!assignedUsers || assignedUsers.length === 0) return [];
+  return assignedUsers.filter((id) => !pressedBy.includes(id));
 }
 
 function areaDone(area, statusMap) {
   const st = normalizeStatusEntry(statusMap?.[area.id]);
-  if (area.needsAed) return st.lock && st.aed;
-  return st.lock;
+  const lockDone = isDoneForAll(area.userIds, st.lock.pressedBy);
+  if (area.needsAed) {
+    const aedDone = isDoneForAll(area.userIds, st.aed.pressedBy);
+    return lockDone && aedDone;
+  }
+  return lockDone;
 }
 
 function isAllDone(dateStr) {
@@ -166,10 +197,14 @@ function buildDailyBlocks(statusMap) {
 
   for (const area of ASSIGNMENTS) {
     const mention = mentionList(area.userIds);
-    const aed = area.needsAed ? '（AED確認含む）' : '';
+    const aed = area.needsAed ? 'AEDの確認もしてください！' : '';
     const st = normalizeStatusEntry(statusMap?.[area.id]);
-    const lockText = st.lock ? '施錠確認済み' : '施錠';
-    const aedText = st.aed ? 'AED確認済み' : 'AED';
+    const lockDone = isDoneForAll(area.userIds, st.lock.pressedBy);
+    const aedDone = isDoneForAll(area.userIds, st.aed.pressedBy);
+    const lockText = lockDone ? '施錠確認済み' : '施錠';
+    const aedText = aedDone ? 'AED確認済み' : 'AED';
+    const lockStyle = lockDone ? undefined : 'primary';
+    const aedStyle = aedDone ? undefined : 'danger';
     blocks.push({
       type: 'section',
       text: {
@@ -184,7 +219,8 @@ function buildDailyBlocks(statusMap) {
           type: 'button',
           action_id: 'lock_check',
           text: { type: 'plain_text', text: lockText, emoji: true },
-          style: 'primary',
+          ...(lockStyle ? { style: lockStyle } : {}),
+          ...(lockDone ? { disabled: true } : {}),
           value: `${area.id}`,
         },
         ...(area.needsAed
@@ -193,7 +229,8 @@ function buildDailyBlocks(statusMap) {
                 type: 'button',
                 action_id: 'aed_check',
                 text: { type: 'plain_text', text: aedText, emoji: true },
-                style: 'danger',
+                ...(aedStyle ? { style: aedStyle } : {}),
+                ...(aedDone ? { disabled: true } : {}),
                 value: `${area.id}`,
               },
             ]
@@ -236,20 +273,22 @@ async function postReminder() {
 
   const lines = pending
     .map((a) => {
-      const mention = mentionList(a.userIds);
+      const st = normalizeStatusEntry(data.status[a.id]);
+      const pendingLock = pendingUsersFor(a.userIds, st.lock.pressedBy);
+      const pendingAed = a.needsAed ? pendingUsersFor(a.userIds, st.aed.pressedBy) : [];
+      const pendingUsers = Array.from(new Set([...pendingLock, ...pendingAed]));
+      const mention = mentionList(pendingUsers);
       return `${a.place} ${mention}`.trim();
     })
     .join('\n');
 
-  const threadTs = getThreadTs(dateStr);
   await app.client.chat.postMessage({
     channel: CHANNEL_ID,
     text: '未確認の施錠があります',
-    ...(threadTs ? { thread_ts: threadTs } : {}),
     blocks: [
       {
         type: 'section',
-        text: { type: 'mrkdwn', text: '*【未確認があります⚠️】*' },
+        text: { type: 'mrkdwn', text: '*【⚠️未確認です⚠️】*' },
       },
       {
         type: 'section',
@@ -270,7 +309,7 @@ app.action('lock_check', async ({ ack, body, payload, client }) => {
   const dateStr = currentDateStr();
   const timeStr = formatTime(now);
   ensureDate(dateStr);
-  markDoneType(dateStr, area.id, 'lock');
+  markDoneType(dateStr, area.id, 'lock', body.user.id);
 
   if (CHANNEL_ID) {
     const threadTs = getThreadTs(dateStr);
@@ -301,7 +340,7 @@ app.action('aed_check', async ({ ack, body, payload, client }) => {
   const dateStr = currentDateStr();
   const timeStr = formatTime(now);
   ensureDate(dateStr);
-  markDoneType(dateStr, area.id, 'aed');
+  markDoneType(dateStr, area.id, 'aed', body.user.id);
 
   if (CHANNEL_ID) {
     const threadTs = getThreadTs(dateStr);
@@ -315,7 +354,7 @@ app.action('aed_check', async ({ ack, body, payload, client }) => {
     if (isAllDone(dateStr)) {
       await client.chat.postMessage({
         channel: CHANNEL_ID,
-        text: '全員回答済み。完了',
+        text: '全員回答済み。完了！ありがとう！！',
       });
     }
   }
